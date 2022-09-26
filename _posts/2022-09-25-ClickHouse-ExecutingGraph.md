@@ -46,7 +46,7 @@ processors_map：IProcessor 到 node 的 id 的 map
 - 对该 node 对应的每个 input port / output port，获取其对应的 output port / input port的 processor 作为 to processor
 - 得到 output port / input port 在 processor 中的 output port number / input port number
 - 创建 edge: 
-  ```Edge edge(0, true, from_input, output_port_number, &nodes[node]->post_updated_input_ports); / Edge edge(0, false, input_port_number, from_output, &nodes[node]->post_updated_output_ports);`
+  `Edge edge(0, true, from_input, output_port_number, &nodes[node]->post_updated_input_ports); / Edge edge(0, false, input_port_number, from_output, &nodes[node]->post_updated_output_ports);`
 - 调用 addEdge：
     - 首先查找 to processor 是否已经在 processors_map 中了，如果不在，就会 throw exception
     - 将 edge→to 设置为 to processor 对应的 node
