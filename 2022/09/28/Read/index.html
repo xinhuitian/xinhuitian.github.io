@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="en">
+
+  <head>
+  <meta charset="utf-8">
+  <meta http-equiv="X-UA-Compatible" content="IE=edge">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+
+  
+  
+  
+  <title>ClickHouse  MergeTree Read 执行流程</title>
+  <meta name="description" content="Overview 这里要分析的主要是生成 pipeline 以后，执行 pull 操作时，ISource::work() 的实际执行流程。本文基于 v21.10 版本代码进行分析。 ISource work 方法执行流程 先看一个大致的执行流程描述。 ISource::work 方法主要是执行的是实际 Processor 的 generate() 方法。我们这里主要分析 readFromPool 这条执行链路，最终生成的是 MergeTreeBaseSelectProcessor， work 会调用到 MergeTreeBaseSelectProcessor::generate() 方法。generate() 方法执行结束后，会以 Chunk 的形式返回这次读取的数据，ISource 会将这个 Chunk 设置为 currentChunk，在下一次执行 prepare 方法时，通过 OutputPort，将 currentChunk 推送给已连接的其他 Processor 的 InputPort。 MergeTreeBaseSelectProcessor 的 generate() 方法首先会去获取一个 read task。这个 task 是一个有状态的结构，如果当前的 task 是一个未完成的状态，则直接拿到这个 task。否则，会通过调用 getNewTask 方法，从 MergeTreeReadPool 中再获取一个新的 task。 每个 task 会包含一个 MarkRanges 结构，包含了它负责读取的所有 mark range。每个 mark range 对应连续的多个 mark。 在获取到 task 之后，MergeTreeBaseSelectProcessor 会进行 range reader 的初始化，之后调用 readFromPartImpl 继续处理。在读取之前，会首先进行 rows_to_read 的计算，通过 max bytes 和 max rows 两个维度的限制，计算出这次读操作最大能读取的行数。最终，调用 MergeTreeRangeReader 的 read 方法，读取指定行数并返回。 上述的流程会不断重复，直到获取到 query 所有的结果。这里涉及到一个关键问题是，如何从上一次的位置继续进行读取操作? 首先，MergeTreeBaseSelectProcessor 会维护一个当前未完成的 task 结构，这个 task 包含了需要读取的所有 MarkRange 信息，这些信息以一个队列的方式进行管理，随着读取的进行，待处理的 MarkRange 不断弹出队列，直至队列为空。MarkRange 从队列中取出以及实际的读取操作由 MergeTreeRangeReader 负责。MergeTreeRangeReader 会为每个当前进行读取的 MarkRange 创建一个 Stream 对象进行读取。一次读取操作可能在读取到某个 MarkRange 的某个位置时结束。读取结束时，MergeTreeRangeReader 会记录好当前读取的 offset，在下一次读取时，再从这里开始进行。当一个 MarkRange 读取完成后，MergeTreeRangeReader 会读取 task 的下一个 MarkRange，继续后续的读取操作。下面对 MergeTreeRangeReader 的读取流程进行详细分析。 MergeTreeRangeReader 读取流程 这里介绍的是一个普通的读取操作的 MergeTreeRangeReader 层操作流程，不考虑 prewhere 的情况。 MergeTreeBaseSelectProcessor 的 readFromPartImpl 通过 read task 的 range_reader 的 read 方法进行实际的读取操作。range_reader 是一个 MergeTreeRangeReader 类型对象，其 read 方法需要给定两个参数：rows_to_read，指定这次读取操作需要读取的最大行数，这个值是通过 current_max_block_size_rows 以及 current_preferred_block_size_bytes 预估出来的，通常最小是 index_granularity 的行数，最大为 65536; 另一个参数是 read task 的 mark_ranges，如上所述，这个是一个包含 task 负责的所有 mark range 的队列，MergeTreeRangeReader 会实际负责从这个队列里不断取出 mark range，进行读写，直至队列为空。 MergeTreeRangeReader 的 read 也采用了分层的设计，MergeTreeRangeReader 类主要负责整个 read task 的操作流程管理。对于每个 mark_range, MergeTreeRangeReader 通过一个 Stream 类来对读取的流程进行管理。而对于每个 mark 的读取，则通过 DelayedStream 类来进行实际操作。 在读取时，MergeTreeRangeReader 首先会检查一个 Stream 是否结束，如果结束了，会调用 finalize 方法，进行最后一部分待读取部分的处理。这里需要注意的是，判断一个 Stream 是否结束的方法是判断当前 mark 是否是最后一个，而不是已经没有数据可读，因此，Stream 结束并不代表 read 操作已经结束，仍需要调用 finalize 来进行后续的处理。当 finalize 调用结束以后，如果 mark_ranges 队列不为空，则弹出一个新的 mark_range, MergeTreeRangeReader 为其创建一个新的 Stream 对象，进行接下来的读取操作。 Stream 未结束之前，都是调用 Stream::read 方法来进行正常的读取操作，该方法最终会调用到实际的 MergeTreeReader（默认是 MergeTreeReaderWide） 来处理真正的读取操作。每次的调用会返回 rows_read, 并记录 current_mark, offset_after_current_mark 等状态信息，实际读取的信息通过一个 Columns 结构的引用传递回去。整体的 read 流程如下图所示。">
+  
+
+  <link rel="stylesheet" href="/assets/main.css">
+  <link rel="canonical" href="https://yous.github.io/2022/09/28/Read/">
+  
+  
+  <link rel="alternate" type="application/rss+xml" title="XinhuiTian&#39;s Note" href="https://yous.github.io/feed.xml">
+
+  
+
+  
+  <meta property="og:title" content="ClickHouse  MergeTree Read 执行流程">
+  <meta property="og:site_name" content="XinhuiTian&#39;s Note">
+  <meta property="og:url" content="https://yous.github.io/2022/09/28/Read/">
+  <meta property="og:description" content="Overview 这里要分析的主要是生成 pipeline 以后，执行 pull 操作时，ISource::work() 的实际执行流程。本文基于 v21.10 版本代码进行分析。 ISource work 方法执行流程 先看一个大致的执行流程描述。 ISource::work 方法主要是执行的是实际 Processor 的 generate() 方法。我们这里主要分析 readFromPool 这条执行链路，最终生成的是 MergeTreeBaseSelectProcessor， work 会调用到 MergeTreeBaseSelectProcessor::generate() 方法。generate() 方法执行结束后，会以 Chunk 的形式返回这次读取的数据，ISource 会将这个 Chunk 设置为 currentChunk，在下一次执行 prepare 方法时，通过 OutputPort，将 currentChunk 推送给已连接的其他 Processor 的 InputPort。 MergeTreeBaseSelectProcessor 的 generate() 方法首先会去获取一个 read task。这个 task 是一个有状态的结构，如果当前的 task 是一个未完成的状态，则直接拿到这个 task。否则，会通过调用 getNewTask 方法，从 MergeTreeReadPool 中再获取一个新的 task。 每个 task 会包含一个 MarkRanges 结构，包含了它负责读取的所有 mark range。每个 mark range 对应连续的多个 mark。 在获取到 task 之后，MergeTreeBaseSelectProcessor 会进行 range reader 的初始化，之后调用 readFromPartImpl 继续处理。在读取之前，会首先进行 rows_to_read 的计算，通过 max bytes 和 max rows 两个维度的限制，计算出这次读操作最大能读取的行数。最终，调用 MergeTreeRangeReader 的 read 方法，读取指定行数并返回。 上述的流程会不断重复，直到获取到 query 所有的结果。这里涉及到一个关键问题是，如何从上一次的位置继续进行读取操作? 首先，MergeTreeBaseSelectProcessor 会维护一个当前未完成的 task 结构，这个 task 包含了需要读取的所有 MarkRange 信息，这些信息以一个队列的方式进行管理，随着读取的进行，待处理的 MarkRange 不断弹出队列，直至队列为空。MarkRange 从队列中取出以及实际的读取操作由 MergeTreeRangeReader 负责。MergeTreeRangeReader 会为每个当前进行读取的 MarkRange 创建一个 Stream 对象进行读取。一次读取操作可能在读取到某个 MarkRange 的某个位置时结束。读取结束时，MergeTreeRangeReader 会记录好当前读取的 offset，在下一次读取时，再从这里开始进行。当一个 MarkRange 读取完成后，MergeTreeRangeReader 会读取 task 的下一个 MarkRange，继续后续的读取操作。下面对 MergeTreeRangeReader 的读取流程进行详细分析。 MergeTreeRangeReader 读取流程 这里介绍的是一个普通的读取操作的 MergeTreeRangeReader 层操作流程，不考虑 prewhere 的情况。 MergeTreeBaseSelectProcessor 的 readFromPartImpl 通过 read task 的 range_reader 的 read 方法进行实际的读取操作。range_reader 是一个 MergeTreeRangeReader 类型对象，其 read 方法需要给定两个参数：rows_to_read，指定这次读取操作需要读取的最大行数，这个值是通过 current_max_block_size_rows 以及 current_preferred_block_size_bytes 预估出来的，通常最小是 index_granularity 的行数，最大为 65536; 另一个参数是 read task 的 mark_ranges，如上所述，这个是一个包含 task 负责的所有 mark range 的队列，MergeTreeRangeReader 会实际负责从这个队列里不断取出 mark range，进行读写，直至队列为空。 MergeTreeRangeReader 的 read 也采用了分层的设计，MergeTreeRangeReader 类主要负责整个 read task 的操作流程管理。对于每个 mark_range, MergeTreeRangeReader 通过一个 Stream 类来对读取的流程进行管理。而对于每个 mark 的读取，则通过 DelayedStream 类来进行实际操作。 在读取时，MergeTreeRangeReader 首先会检查一个 Stream 是否结束，如果结束了，会调用 finalize 方法，进行最后一部分待读取部分的处理。这里需要注意的是，判断一个 Stream 是否结束的方法是判断当前 mark 是否是最后一个，而不是已经没有数据可读，因此，Stream 结束并不代表 read 操作已经结束，仍需要调用 finalize 来进行后续的处理。当 finalize 调用结束以后，如果 mark_ranges 队列不为空，则弹出一个新的 mark_range, MergeTreeRangeReader 为其创建一个新的 Stream 对象，进行接下来的读取操作。 Stream 未结束之前，都是调用 Stream::read 方法来进行正常的读取操作，该方法最终会调用到实际的 MergeTreeReader（默认是 MergeTreeReaderWide） 来处理真正的读取操作。每次的调用会返回 rows_read, 并记录 current_mark, offset_after_current_mark 等状态信息，实际读取的信息通过一个 Columns 结构的引用传递回去。整体的 read 流程如下图所示。">
+  
+  
+  <meta name="twitter:card" content="summary">
+  
+  <meta name="twitter:title" content="ClickHouse  MergeTree Read 执行流程">
+  <meta name="twitter:description" content="Overview 这里要分析的主要是生成 pipeline 以后，执行 pull 操作时，ISource::work() 的实际执行流程。本文基于 v21.10 版本代码进行分析。 ISource work 方法执行流程 先看一个大致的执行流程描述。 ISource::work 方法主要是执行的是实际 Processor 的 generate() 方法。我们这里主要分析 readFromPo...">
+  
+  
+
+  <link rel="dns-prefetch" href="https://fonts.gstatic.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Bitter:ital,wght@0,400;0,700;1,400&amp;display=swap" rel="stylesheet">
+
+  
+
+</head>
+
+
+  <body>
+
+    <header class="site-header">
+
+  <div class="wrapper">
+
+    <a class="site-title" href="/">XinhuiTian&#39;s Note</a>
+
+    <nav class="site-nav">
+      
+        
+        <a class="page-link" href="/about/">About</a>
+      
+        
+        <a class="page-link" href="/archives/">Archives</a>
+      
+    </nav>
+
+  </div>
+
+</header>
+
+
+    <main class="page-content" aria-label="Content">
+      <div class="wrapper">
+        <article class="post" itemscope itemtype="http://schema.org/BlogPosting">
+
+  <header class="post-header">
+    
+      <h1 class="post-title" itemprop="name headline">ClickHouse  MergeTree Read 执行流程</h1>
+    
+    <p class="post-meta"><time datetime="2022-09-28T16:08:00+00:00" itemprop="datePublished">Sep 28, 2022</time> •
+  
+    
+    
+      
+    
+      
+        <a href="/categories/clickhouse/">ClickHouse</a>,
+      
+    
+      
+    
+      
+    
+      
+    
+  
+    
+    
+      
+    
+      
+    
+      
+    
+      
+        <a href="/categories/mergetree/">MergeTree</a>,
+      
+    
+      
+    
+  
+    
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+        <a href="/categories/read/">Read</a>
+      
+    
+  
+
+
+
+</p>
+  </header>
+
+  <div class="post-content" itemprop="articleBody">
+    <h2>Overview</h2>
+
+<p>这里要分析的主要是生成 pipeline 以后，执行 pull 操作时，ISource::work() 的实际执行流程。本文基于 v21.10 版本代码进行分析。</p>
+
+<h2>ISource work 方法执行流程</h2>
+
+<p>先看一个大致的执行流程描述。</p>
+
+<p><img src="/assets/isource.svg" alt="isource" /></p>
+
+<p>ISource::work 方法主要是执行的是实际 Processor 的 generate() 方法。我们这里主要分析 readFromPool 这条执行链路，最终生成的是 MergeTreeBaseSelectProcessor， work 会调用到 MergeTreeBaseSelectProcessor::generate() 方法。generate() 方法执行结束后，会以 Chunk 的形式返回这次读取的数据，ISource 会将这个 Chunk 设置为 currentChunk，在下一次执行 prepare 方法时，通过 OutputPort，将 currentChunk 推送给已连接的其他 Processor 的 InputPort。</p>
+
+<p>MergeTreeBaseSelectProcessor 的 generate() 方法首先会去获取一个 read task。这个 task 是一个有状态的结构，如果当前的 task 是一个未完成的状态，则直接拿到这个 task。否则，会通过调用 getNewTask 方法，从 MergeTreeReadPool 中再获取一个新的 task。</p>
+
+<p>每个 task 会包含一个 MarkRanges 结构，包含了它负责读取的所有 mark range。每个 mark range 对应连续的多个 mark。</p>
+
+<p>在获取到 task 之后，MergeTreeBaseSelectProcessor 会进行 range reader 的初始化，之后调用 readFromPartImpl 继续处理。在读取之前，会首先进行 rows_to_read 的计算，通过 max bytes 和 max rows 两个维度的限制，计算出这次读操作最大能读取的行数。最终，调用 MergeTreeRangeReader 的 read 方法，读取指定行数并返回。</p>
+
+<p>上述的流程会不断重复，直到获取到 query 所有的结果。这里涉及到一个关键问题是，如何从上一次的位置继续进行读取操作?</p>
+
+<p>首先，MergeTreeBaseSelectProcessor 会维护一个当前未完成的 task 结构，这个 task 包含了需要读取的所有 MarkRange 信息，这些信息以一个队列的方式进行管理，随着读取的进行，待处理的 MarkRange 不断弹出队列，直至队列为空。MarkRange 从队列中取出以及实际的读取操作由 MergeTreeRangeReader 负责。MergeTreeRangeReader 会为每个当前进行读取的 MarkRange 创建一个 Stream 对象进行读取。一次读取操作可能在读取到某个 MarkRange 的某个位置时结束。读取结束时，MergeTreeRangeReader 会记录好当前读取的 offset，在下一次读取时，再从这里开始进行。当一个 MarkRange 读取完成后，MergeTreeRangeReader 会读取 task 的下一个 MarkRange，继续后续的读取操作。下面对 MergeTreeRangeReader 的读取流程进行详细分析。</p>
+
+<h2>MergeTreeRangeReader 读取流程</h2>
+
+<p>这里介绍的是一个普通的读取操作的 MergeTreeRangeReader 层操作流程，不考虑 prewhere 的情况。</p>
+
+<p>MergeTreeBaseSelectProcessor 的 readFromPartImpl 通过 read task 的 range_reader 的 read 方法进行实际的读取操作。range_reader 是一个 MergeTreeRangeReader 类型对象，其 read 方法需要给定两个参数：rows_to_read，指定这次读取操作需要读取的最大行数，这个值是通过 current_max_block_size_rows 以及 current_preferred_block_size_bytes 预估出来的，通常最小是 index_granularity 的行数，最大为 65536;  另一个参数是 read task 的 mark_ranges，如上所述，这个是一个包含 task 负责的所有 mark range 的队列，MergeTreeRangeReader 会实际负责从这个队列里不断取出 mark range，进行读写，直至队列为空。</p>
+
+<p>MergeTreeRangeReader 的 read 也采用了分层的设计，MergeTreeRangeReader 类主要负责整个 read task 的操作流程管理。对于每个 mark_range, MergeTreeRangeReader 通过一个 Stream 类来对读取的流程进行管理。而对于每个 mark 的读取，则通过 DelayedStream 类来进行实际操作。</p>
+
+<p><img src="/assets/range_reader.svg" alt="range_reader" /></p>
+
+<p>在读取时，MergeTreeRangeReader 首先会检查一个 Stream 是否结束，如果结束了，会调用 finalize 方法，进行最后一部分待读取部分的处理。这里需要注意的是，判断一个 Stream 是否结束的方法是判断当前 mark 是否是最后一个，而不是已经没有数据可读，因此，Stream 结束并不代表 read 操作已经结束，仍需要调用 finalize 来进行后续的处理。当 finalize 调用结束以后，如果 mark_ranges 队列不为空，则弹出一个新的 mark_range, MergeTreeRangeReader 为其创建一个新的 Stream 对象，进行接下来的读取操作。</p>
+
+<p>Stream 未结束之前，都是调用 Stream::read 方法来进行正常的读取操作，该方法最终会调用到实际的 MergeTreeReader（默认是 MergeTreeReaderWide） 来处理真正的读取操作。每次的调用会返回 rows_read, 并记录 current_mark, offset_after_current_mark 等状态信息，实际读取的信息通过一个 Columns 结构的引用传递回去。整体的 read 流程如下图所示。</p>
+
+<p><img src="/assets/read.svg" alt="" /></p>
+
+
+  </div>
+
+  
+
+</article>
+
+      </div>
+    </main>
+
+    <footer class="site-footer">
+
+  <div class="wrapper">
+
+    <p>
+      
+
+&copy; xht - Powered by <a href="https://jekyllrb.com">Jekyll</a> &amp; <a href="https://github.com/yous/whiteglass">whiteglass</a> - Subscribe via <a href="https://yous.github.io/feed.xml">RSS</a>
+
+    </p>
+
+  </div>
+
+</footer>
+
+
+  </body>
+
+</html>

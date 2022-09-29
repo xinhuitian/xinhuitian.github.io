@@ -1,0 +1,540 @@
+<!DOCTYPE html>
+<html lang="en">
+
+  <head>
+  <meta charset="utf-8">
+  <meta http-equiv="X-UA-Compatible" content="IE=edge">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+
+  
+  
+  
+  <title>多态：概念与实现</title>
+  <meta name="description" content="概念 多态（polymorphism），字面意思的解释是指一个 function or object 可以在不同情况下有不同的行为。多态从实现上大致分为静态多态（static polymorphism）和动态多态（dynamic polymorphism）两种。 以下三节主要参考：Polymorphism in C++ - cppdev 与 Performance of dynamic polymorphism - cppdev 两篇文章 动态多态（Dynamic Polymorphism） 动态指是真正执行的代码是在 运行时 才能确定的。 实现主要依赖于 virtual function 的 overriding。 example： class Base { public: int a; virtual void doSomething() { std::cout &amp;lt;&amp;lt; &quot;doSomething from Base\n&quot;; } virtual void doOtherThing() { std::cout &amp;lt;&amp;lt; &quot;doOtherThing from Base\n&quot;; } }; class Derived : public Base { public: int b, c; void doSomething() override // override implies virtual { std::cout &amp;lt;&amp;lt; &quot;doSomething from Derived\n&quot;; } }; std::shared_ptr&amp;lt;Base&amp;gt; b{std::make_shared&amp;lt;Derived&amp;gt;()}; b-&amp;gt;doSomething(); // prints &quot;doSomething from Derived&quot; 当一个 function 被 virtual 定义时，编译器会得知这个 function 可能会在子类中被重定义，因此只能在 runtime 时才能得到正确的执行代码。那么程序如何在运行时找到正确的 function？这里就需要依赖 vtable 与 vptr 结构。 vtable 与 vptr 每个包含 virtual function 的 class 都会包含一个 vptr 用于指向一个 vtable 结构。vtable 用于存储一个 class 的所有 virtual function 的地址信息。 通过 -O0 得到的编译代码中，vtable 信息如下： 具体的编译结果可见：Compiler Explorer 静态多态（Static Polymorphism） 静态多态的静态是指 object 的类型以及要调用的 function 都是在编译器就决定好的。通常实现静态多态的方式主要包括： function overloading operator overloading templates // function overloading double do_oper(int a) // #1 { return a * 2; } double do_oper(double a) // #2 { return a * 2; } auto oper1 = do_oper(5); // #1 is called auto oper2 = do_oper(5.0); // #2 is called // operator overloading(already provided by compiler) auto sum = 1 + 2; // operator+ adds the integers auto concat = std::string{&quot;1&quot;} + std::string{&quot;2&quot;}; // operator+ concatenates the strings auto sum_double = do_sum(1.0, 2.0); // double do_sum(double a, double b) is called // template template &amp;lt;class T&amp;gt; T do_sum(T a, T b) { return a + b; } auto sum_int = do_sum(1, 2); // int do_sum(int a, int b) is called 此外，使用 template 实现静态多态还有一种专门的设计方式：CRTP（curiously recurring template pattern ） 其定义方式如下： template&amp;lt;class Z&amp;gt; class Y {}; class X : public Y&amp;lt;X&amp;gt; {}; 通常的设计是在 base class 中，实现一个函数，将 base 强转为 T 对应的 class，调用其对应的 function example： #include &amp;lt;iostream&amp;gt; template &amp;lt;class Derived&amp;gt; struct Base { void name() { (static_cast&amp;lt;Derived*&amp;gt;(this))-&amp;gt;impl(); } }; struct D1 : public Base&amp;lt;D1&amp;gt; { void impl() { std::cout &amp;lt;&amp;lt; &quot;D1::impl()\n&quot;; } }; struct D2 : public Base&amp;lt;D2&amp;gt; { void impl() { std::cout &amp;lt;&amp;lt; &quot;D2::impl()\n&quot;; } }; int main() { Base&amp;lt;D1&amp;gt; b1; b1.name(); Base&amp;lt;D2&amp;gt; b2; b2.name(); D1 d1; d1.name(); D2 d2; d2.name(); } // output: D1::impl() D2::impl() D1::impl() D2::impl() 动态多态的性能问题 运行时才能确定真正执行的函数，会带来以下问题： 额外的存储空间（vptr） 额外的重定向 (pointer dereference) 无法 inline 化 cache miss 额外的存储空间与重定向 相比 native 的函数调用，多了一步查表操作 例子：https://quick-bench.com/q/E9ZRucuYA6zh7lHeN3wsyGNWUvo 因此，对于不会被用作 base 的 class，不要为其定义 virtual functions，尤其是 virtual deconstructor：Effective C++：Item 7 无法 inline 化 当 virtual function 需要通过 vptr 来调用时，compiler 无法对其进行 inline 优化 class Base { public: virtual bool doSomething() { return true; } }; class Derived : public Base { bool doSomething() override { return false; } }; Base b; b.doSomething(); // this can be inlined Base* b1 = new Derived; b1-&amp;gt;doSomething(); // this cannot delete b1; cache miss 使用 virtual function 带来的 cache miss 会远大于使用 template 的情况 example: static void DynamicPolymorphism() { std::vector&amp;lt;BaseDP*&amp;gt; ptrs; for (int i = 0; i &amp;lt; 5000; i++) { ptrs.push_back(new DerivedDP); } // profiling for (const auto&amp;amp; ptr : ptrs) ptr-&amp;gt;process(); // Make sure the variable is not optimized away by compiler // benchmark::DoNotOptimize(created_string); for (auto&amp;amp; ptr : ptrs) delete ptr; } static void StaticPolymorphism() { std::vector&amp;lt;BaseSP&amp;lt;DerivedSP&amp;gt;*&amp;gt; ptrs; for (int i = 0; i &amp;lt; 5000; i++) { ptrs.push_back(new BaseSP&amp;lt;DerivedSP&amp;gt;); } // profilling for (const auto&amp;amp; ptr : ptrs) ptr-&amp;gt;process(); for (auto&amp;amp; ptr : ptrs) delete ptr; } 使用 cachegrind 和 qcachegrind（mac 上，linux 是 kcachegrind） 查看 cache 命中情况： 其他替代 virtual function 的方法 基于 std::variant std::variant 是 c++17 引入的类型安全的 union 结构。一个 std::variant 实例只能是其定义的一种类型，极少可能会达到 no value 的状态 ([std::variant::valueless_by_exception](https://en.cppreference.com/w/cpp/utility/variant/valueless_by_exception)) 。 用 std::variant 实现多态，需要基于一种 visitor 设计模式，即定义好所有的类型，对每个类型编写对应的 function 实现，在实际调用时基于 variant 的 value 类型选择要执行的 function。 example： struct Type { Type(int type) : type_(type) { } int type_; }; struct A { int f_impl() const { return 1; } }; struct B { int f_impl() const { return 2; } }; /// 定义 variant using VAR=std::vector&amp;lt;std::variant&amp;lt;A, B&amp;gt;&amp;gt;; VAR var; for (int i = 0; i &amp;lt; 1000; ++i) { std::variant&amp;lt;A, B&amp;gt; va; if (i % 2) va = A(); else va = B(); var.push_back(va); } /// visit with std::visit int v_total = 0; struct CallFunc { void operator()(const A&amp;amp; a) const { v_total += a.f_impl(); } void operator()(const B&amp;amp; b) const { v_total += b.f_impl(); } }; for (int i = 0; i &amp;lt; 100000; ++i) for (auto &amp;amp; v : var) std::visit(CallFunc{}, v); /// visit with holds_alternative int callFImpl(const std::variant&amp;lt;A, B&amp;gt;&amp;amp; type) { if (std::holds_alternative&amp;lt;A&amp;gt;(type)) { return std::get&amp;lt;A&amp;gt;(type).f_impl(); } return std::get&amp;lt;B&amp;gt;(type).f_impl(); } total = 0; for (int i = 0; i &amp;lt; 100000; ++i) for (auto &amp;amp; v : var) total += callFImpl(v); std::variant 与 virtual function 的比较： 性能比较： Quick C++ Benchmarks 基于 concept 主要基于 Replacing CRTP Static Polymorphism With Concepts - Fluent C++ 整理 CRTP 的问题： 多了一层间接的调用语意，可读性比较差，比如下面的代码，需要实现不同的 log 级别输出， 以 CRTP 的写法如下： template &amp;lt;typename TLoggerImpl&amp;gt; class Logger { public: void LogDebug(std::string_view message) { Impl().DoLogDebug(message); } void LogInfo(std::string_view message) { Impl().DoLogInfo(message); } void LogError(std::string_view message) { Impl().DoLogError(message); } private: *TLoggerImpl&amp;amp; Impl() { return static_cast&amp;lt;TLoggerImpl&amp;amp;&amp;gt;(*this); } * friend TLoggerImpl; }; template &amp;lt;typename TLoggerImpl&amp;gt; void LogToAll(Logger&amp;lt;TLoggerImpl&amp;gt;&amp;amp; logger, std::string_view message) { logger.LogDebug(message); logger.LogInfo(message); logger.LogError(message); } struct CustomLogger : public Logger&amp;lt;CustomLogger&amp;gt; { void DoLogDebug(std::string_view message) const { std::cout &amp;lt;&amp;lt; &quot;[Debug] &quot; &amp;lt;&amp;lt; message &amp;lt;&amp;lt; &#39;\n&#39;; } void DoLogInfo(std::string_view message) const { std::cout &amp;lt;&amp;lt; &quot;[Info] &quot; &amp;lt;&amp;lt; message &amp;lt;&amp;lt; &#39;\n&#39;; } void DoLogError(std::string_view message) const { std::cout &amp;lt;&amp;lt; &quot;[Error] &quot; &amp;lt;&amp;lt; message &amp;lt;&amp;lt; &#39;\n&#39;; } }; struct TestLogger : public Logger&amp;lt;TestLogger&amp;gt; { void DoLogDebug(std::string_view) const {} void DoLogInfo(std::string_view) const {} void DoLogError(std::string_view) const {} }; CustomLogger custom_logger; LogToAll(custom_logger, “Hello World”); TestLogger test_logger; LogToAll(test_logger, “Hello World”); concept 在 c++ 20 引入，用于为 template 的 type 规定限制条件，以下是上面 Log 功能的 concept 实现。 /// 定义一个 concept template &amp;lt;typename TLoggerImpl&amp;gt; concept LoggerLike = requires(TLoggerImpl log) { log.LogDebug(std::string_view{}); log.LogInfo(std::string_view{}); log.LogError(std::string_view{}); }; /// 定义调用类1 struct CustomLogger { void LogDebug(std::string_view message) const { std::cout &amp;lt;&amp;lt; &quot;[Debug] &quot; &amp;lt;&amp;lt; message &amp;lt;&amp;lt; &#39;\n&#39;; } void LogInfo(std::string_view message) const { std::cout &amp;lt;&amp;lt; &quot;[Info] &quot; &amp;lt;&amp;lt; message &amp;lt;&amp;lt; &#39;\n&#39;; } void LogError(std::string_view message) const { std::cout &amp;lt;&amp;lt; &quot;[Error] &quot; &amp;lt;&amp;lt; message &amp;lt;&amp;lt; &#39;\n&#39;; } }; /// 定义调用类2 struct TestLogger { void LogDebug(std::string_view) const {} void LogInfo(std::string_view) const {} void LogError(std::string_view) const {} }; /// 定义调用方法 template &amp;lt;LoggerLike TLogger&amp;gt; void LogToAll(TLogger&amp;amp; logger, std::string_view message) { logger.LogDebug(message); logger.LogInfo(message); logger.LogError(message); } struct CustomLoggerImpl { … }; struct TestLoggerImpl { … }; using CustomLogger = Logger&amp;lt;CustomLoggerImpl&amp;gt;; using TestLogger = Logger&amp;lt;TestLoggerImpl&amp;gt;; /// 实际调用 CustomLogger custom_logger; LogToAll(custom_logger, &quot;Hello World&quot;); TestLogger test_logger; LogToAll(test_logger, &quot;Hello World&quot;); Reference Polymorphism in C++ - cppdev Performance of dynamic polymorphism - cppdev Curiously Recurring Template Pattern - cppreference.com Item 7: Declare destructors virtual in polymorphic base classes https://valgrind.org/docs/manual/cg-manual.html https://en.cppreference.com/w/cpp/utility/variant Inheritance vs std::variant https://stackoverflow.com/questions/57726401/stdvariant-vs-inheritance-vs-other-ways-performance https://en.cppreference.com/w/cpp/language/constraints https://quick-bench.com/q/qKvbnsqH1MILeQNWg3XpFfS9f3s Concept-based polymorphism in modern C++ · GitHub Interfaces with C++20 Concepts cppfiddler Replacing CRTP Static Polymorphism With Concepts - Fluent C++">
+  
+
+  <link rel="stylesheet" href="/assets/main.css">
+  <link rel="canonical" href="https://yous.github.io/2022/09/19/C++-%E5%A4%9A%E6%80%81-%E6%A6%82%E5%BF%B5%E4%B8%8E%E5%AE%9E%E7%8E%B0/">
+  
+  
+  <link rel="alternate" type="application/rss+xml" title="XinhuiTian&#39;s Note" href="https://yous.github.io/feed.xml">
+
+  
+
+  
+  <meta property="og:title" content="多态：概念与实现">
+  <meta property="og:site_name" content="XinhuiTian&#39;s Note">
+  <meta property="og:url" content="https://yous.github.io/2022/09/19/C++-%E5%A4%9A%E6%80%81-%E6%A6%82%E5%BF%B5%E4%B8%8E%E5%AE%9E%E7%8E%B0/">
+  <meta property="og:description" content="概念 多态（polymorphism），字面意思的解释是指一个 function or object 可以在不同情况下有不同的行为。多态从实现上大致分为静态多态（static polymorphism）和动态多态（dynamic polymorphism）两种。 以下三节主要参考：Polymorphism in C++ - cppdev 与 Performance of dynamic polymorphism - cppdev 两篇文章 动态多态（Dynamic Polymorphism） 动态指是真正执行的代码是在 运行时 才能确定的。 实现主要依赖于 virtual function 的 overriding。 example： class Base { public: int a; virtual void doSomething() { std::cout &amp;lt;&amp;lt; &quot;doSomething from Base\n&quot;; } virtual void doOtherThing() { std::cout &amp;lt;&amp;lt; &quot;doOtherThing from Base\n&quot;; } }; class Derived : public Base { public: int b, c; void doSomething() override // override implies virtual { std::cout &amp;lt;&amp;lt; &quot;doSomething from Derived\n&quot;; } }; std::shared_ptr&amp;lt;Base&amp;gt; b{std::make_shared&amp;lt;Derived&amp;gt;()}; b-&amp;gt;doSomething(); // prints &quot;doSomething from Derived&quot; 当一个 function 被 virtual 定义时，编译器会得知这个 function 可能会在子类中被重定义，因此只能在 runtime 时才能得到正确的执行代码。那么程序如何在运行时找到正确的 function？这里就需要依赖 vtable 与 vptr 结构。 vtable 与 vptr 每个包含 virtual function 的 class 都会包含一个 vptr 用于指向一个 vtable 结构。vtable 用于存储一个 class 的所有 virtual function 的地址信息。 通过 -O0 得到的编译代码中，vtable 信息如下： 具体的编译结果可见：Compiler Explorer 静态多态（Static Polymorphism） 静态多态的静态是指 object 的类型以及要调用的 function 都是在编译器就决定好的。通常实现静态多态的方式主要包括： function overloading operator overloading templates // function overloading double do_oper(int a) // #1 { return a * 2; } double do_oper(double a) // #2 { return a * 2; } auto oper1 = do_oper(5); // #1 is called auto oper2 = do_oper(5.0); // #2 is called // operator overloading(already provided by compiler) auto sum = 1 + 2; // operator+ adds the integers auto concat = std::string{&quot;1&quot;} + std::string{&quot;2&quot;}; // operator+ concatenates the strings auto sum_double = do_sum(1.0, 2.0); // double do_sum(double a, double b) is called // template template &amp;lt;class T&amp;gt; T do_sum(T a, T b) { return a + b; } auto sum_int = do_sum(1, 2); // int do_sum(int a, int b) is called 此外，使用 template 实现静态多态还有一种专门的设计方式：CRTP（curiously recurring template pattern ） 其定义方式如下： template&amp;lt;class Z&amp;gt; class Y {}; class X : public Y&amp;lt;X&amp;gt; {}; 通常的设计是在 base class 中，实现一个函数，将 base 强转为 T 对应的 class，调用其对应的 function example： #include &amp;lt;iostream&amp;gt; template &amp;lt;class Derived&amp;gt; struct Base { void name() { (static_cast&amp;lt;Derived*&amp;gt;(this))-&amp;gt;impl(); } }; struct D1 : public Base&amp;lt;D1&amp;gt; { void impl() { std::cout &amp;lt;&amp;lt; &quot;D1::impl()\n&quot;; } }; struct D2 : public Base&amp;lt;D2&amp;gt; { void impl() { std::cout &amp;lt;&amp;lt; &quot;D2::impl()\n&quot;; } }; int main() { Base&amp;lt;D1&amp;gt; b1; b1.name(); Base&amp;lt;D2&amp;gt; b2; b2.name(); D1 d1; d1.name(); D2 d2; d2.name(); } // output: D1::impl() D2::impl() D1::impl() D2::impl() 动态多态的性能问题 运行时才能确定真正执行的函数，会带来以下问题： 额外的存储空间（vptr） 额外的重定向 (pointer dereference) 无法 inline 化 cache miss 额外的存储空间与重定向 相比 native 的函数调用，多了一步查表操作 例子：https://quick-bench.com/q/E9ZRucuYA6zh7lHeN3wsyGNWUvo 因此，对于不会被用作 base 的 class，不要为其定义 virtual functions，尤其是 virtual deconstructor：Effective C++：Item 7 无法 inline 化 当 virtual function 需要通过 vptr 来调用时，compiler 无法对其进行 inline 优化 class Base { public: virtual bool doSomething() { return true; } }; class Derived : public Base { bool doSomething() override { return false; } }; Base b; b.doSomething(); // this can be inlined Base* b1 = new Derived; b1-&amp;gt;doSomething(); // this cannot delete b1; cache miss 使用 virtual function 带来的 cache miss 会远大于使用 template 的情况 example: static void DynamicPolymorphism() { std::vector&amp;lt;BaseDP*&amp;gt; ptrs; for (int i = 0; i &amp;lt; 5000; i++) { ptrs.push_back(new DerivedDP); } // profiling for (const auto&amp;amp; ptr : ptrs) ptr-&amp;gt;process(); // Make sure the variable is not optimized away by compiler // benchmark::DoNotOptimize(created_string); for (auto&amp;amp; ptr : ptrs) delete ptr; } static void StaticPolymorphism() { std::vector&amp;lt;BaseSP&amp;lt;DerivedSP&amp;gt;*&amp;gt; ptrs; for (int i = 0; i &amp;lt; 5000; i++) { ptrs.push_back(new BaseSP&amp;lt;DerivedSP&amp;gt;); } // profilling for (const auto&amp;amp; ptr : ptrs) ptr-&amp;gt;process(); for (auto&amp;amp; ptr : ptrs) delete ptr; } 使用 cachegrind 和 qcachegrind（mac 上，linux 是 kcachegrind） 查看 cache 命中情况： 其他替代 virtual function 的方法 基于 std::variant std::variant 是 c++17 引入的类型安全的 union 结构。一个 std::variant 实例只能是其定义的一种类型，极少可能会达到 no value 的状态 ([std::variant::valueless_by_exception](https://en.cppreference.com/w/cpp/utility/variant/valueless_by_exception)) 。 用 std::variant 实现多态，需要基于一种 visitor 设计模式，即定义好所有的类型，对每个类型编写对应的 function 实现，在实际调用时基于 variant 的 value 类型选择要执行的 function。 example： struct Type { Type(int type) : type_(type) { } int type_; }; struct A { int f_impl() const { return 1; } }; struct B { int f_impl() const { return 2; } }; /// 定义 variant using VAR=std::vector&amp;lt;std::variant&amp;lt;A, B&amp;gt;&amp;gt;; VAR var; for (int i = 0; i &amp;lt; 1000; ++i) { std::variant&amp;lt;A, B&amp;gt; va; if (i % 2) va = A(); else va = B(); var.push_back(va); } /// visit with std::visit int v_total = 0; struct CallFunc { void operator()(const A&amp;amp; a) const { v_total += a.f_impl(); } void operator()(const B&amp;amp; b) const { v_total += b.f_impl(); } }; for (int i = 0; i &amp;lt; 100000; ++i) for (auto &amp;amp; v : var) std::visit(CallFunc{}, v); /// visit with holds_alternative int callFImpl(const std::variant&amp;lt;A, B&amp;gt;&amp;amp; type) { if (std::holds_alternative&amp;lt;A&amp;gt;(type)) { return std::get&amp;lt;A&amp;gt;(type).f_impl(); } return std::get&amp;lt;B&amp;gt;(type).f_impl(); } total = 0; for (int i = 0; i &amp;lt; 100000; ++i) for (auto &amp;amp; v : var) total += callFImpl(v); std::variant 与 virtual function 的比较： 性能比较： Quick C++ Benchmarks 基于 concept 主要基于 Replacing CRTP Static Polymorphism With Concepts - Fluent C++ 整理 CRTP 的问题： 多了一层间接的调用语意，可读性比较差，比如下面的代码，需要实现不同的 log 级别输出， 以 CRTP 的写法如下： template &amp;lt;typename TLoggerImpl&amp;gt; class Logger { public: void LogDebug(std::string_view message) { Impl().DoLogDebug(message); } void LogInfo(std::string_view message) { Impl().DoLogInfo(message); } void LogError(std::string_view message) { Impl().DoLogError(message); } private: *TLoggerImpl&amp;amp; Impl() { return static_cast&amp;lt;TLoggerImpl&amp;amp;&amp;gt;(*this); } * friend TLoggerImpl; }; template &amp;lt;typename TLoggerImpl&amp;gt; void LogToAll(Logger&amp;lt;TLoggerImpl&amp;gt;&amp;amp; logger, std::string_view message) { logger.LogDebug(message); logger.LogInfo(message); logger.LogError(message); } struct CustomLogger : public Logger&amp;lt;CustomLogger&amp;gt; { void DoLogDebug(std::string_view message) const { std::cout &amp;lt;&amp;lt; &quot;[Debug] &quot; &amp;lt;&amp;lt; message &amp;lt;&amp;lt; &#39;\n&#39;; } void DoLogInfo(std::string_view message) const { std::cout &amp;lt;&amp;lt; &quot;[Info] &quot; &amp;lt;&amp;lt; message &amp;lt;&amp;lt; &#39;\n&#39;; } void DoLogError(std::string_view message) const { std::cout &amp;lt;&amp;lt; &quot;[Error] &quot; &amp;lt;&amp;lt; message &amp;lt;&amp;lt; &#39;\n&#39;; } }; struct TestLogger : public Logger&amp;lt;TestLogger&amp;gt; { void DoLogDebug(std::string_view) const {} void DoLogInfo(std::string_view) const {} void DoLogError(std::string_view) const {} }; CustomLogger custom_logger; LogToAll(custom_logger, “Hello World”); TestLogger test_logger; LogToAll(test_logger, “Hello World”); concept 在 c++ 20 引入，用于为 template 的 type 规定限制条件，以下是上面 Log 功能的 concept 实现。 /// 定义一个 concept template &amp;lt;typename TLoggerImpl&amp;gt; concept LoggerLike = requires(TLoggerImpl log) { log.LogDebug(std::string_view{}); log.LogInfo(std::string_view{}); log.LogError(std::string_view{}); }; /// 定义调用类1 struct CustomLogger { void LogDebug(std::string_view message) const { std::cout &amp;lt;&amp;lt; &quot;[Debug] &quot; &amp;lt;&amp;lt; message &amp;lt;&amp;lt; &#39;\n&#39;; } void LogInfo(std::string_view message) const { std::cout &amp;lt;&amp;lt; &quot;[Info] &quot; &amp;lt;&amp;lt; message &amp;lt;&amp;lt; &#39;\n&#39;; } void LogError(std::string_view message) const { std::cout &amp;lt;&amp;lt; &quot;[Error] &quot; &amp;lt;&amp;lt; message &amp;lt;&amp;lt; &#39;\n&#39;; } }; /// 定义调用类2 struct TestLogger { void LogDebug(std::string_view) const {} void LogInfo(std::string_view) const {} void LogError(std::string_view) const {} }; /// 定义调用方法 template &amp;lt;LoggerLike TLogger&amp;gt; void LogToAll(TLogger&amp;amp; logger, std::string_view message) { logger.LogDebug(message); logger.LogInfo(message); logger.LogError(message); } struct CustomLoggerImpl { … }; struct TestLoggerImpl { … }; using CustomLogger = Logger&amp;lt;CustomLoggerImpl&amp;gt;; using TestLogger = Logger&amp;lt;TestLoggerImpl&amp;gt;; /// 实际调用 CustomLogger custom_logger; LogToAll(custom_logger, &quot;Hello World&quot;); TestLogger test_logger; LogToAll(test_logger, &quot;Hello World&quot;); Reference Polymorphism in C++ - cppdev Performance of dynamic polymorphism - cppdev Curiously Recurring Template Pattern - cppreference.com Item 7: Declare destructors virtual in polymorphic base classes https://valgrind.org/docs/manual/cg-manual.html https://en.cppreference.com/w/cpp/utility/variant Inheritance vs std::variant https://stackoverflow.com/questions/57726401/stdvariant-vs-inheritance-vs-other-ways-performance https://en.cppreference.com/w/cpp/language/constraints https://quick-bench.com/q/qKvbnsqH1MILeQNWg3XpFfS9f3s Concept-based polymorphism in modern C++ · GitHub Interfaces with C++20 Concepts cppfiddler Replacing CRTP Static Polymorphism With Concepts - Fluent C++">
+  
+  
+  <meta name="twitter:card" content="summary">
+  
+  <meta name="twitter:title" content="多态：概念与实现">
+  <meta name="twitter:description" content="概念 多态（polymorphism），字面意思的解释是指一个 function or object 可以在不同情况下有不同的行为。多态从实现上大致分为静态多态（static polymorphism）和动态多态（dynamic polymorphism）两种。 以下三节主要参考：Polymorphism in C++ - cppdev 与 Performance of dynamic po...">
+  
+  
+
+  <link rel="dns-prefetch" href="https://fonts.gstatic.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Bitter:ital,wght@0,400;0,700;1,400&amp;display=swap" rel="stylesheet">
+
+  
+
+</head>
+
+
+  <body>
+
+    <header class="site-header">
+
+  <div class="wrapper">
+
+    <a class="site-title" href="/">XinhuiTian&#39;s Note</a>
+
+    <nav class="site-nav">
+      
+        
+        <a class="page-link" href="/about/">About</a>
+      
+        
+        <a class="page-link" href="/archives/">Archives</a>
+      
+    </nav>
+
+  </div>
+
+</header>
+
+
+    <main class="page-content" aria-label="Content">
+      <div class="wrapper">
+        <article class="post" itemscope itemtype="http://schema.org/BlogPosting">
+
+  <header class="post-header">
+    
+      <h1 class="post-title" itemprop="name headline">多态：概念与实现</h1>
+    
+    <p class="post-meta"><time datetime="2022-09-19T16:08:00+00:00" itemprop="datePublished">Sep 19, 2022</time> •
+  
+    
+    
+      
+        <a href="/categories/c/">C++</a>
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+  
+
+
+
+</p>
+  </header>
+
+  <div class="post-content" itemprop="articleBody">
+    <h1>概念</h1>
+
+<p>多态（polymorphism），字面意思的解释是指一个 function or object 可以在不同情况下有不同的行为。多态从实现上大致分为静态多态（static polymorphism）和动态多态（dynamic polymorphism）两种。</p>
+
+<p>以下三节主要参考：<a href="https://thecppdev.com/2022/05/22/polymorphism-in-c/?noamp=available">Polymorphism in C++ - cppdev</a> 与 <a href="https://thecppdev.com/2022/05/26/dynamic-polymorphism-performance/?noamp=available">Performance of dynamic polymorphism - cppdev</a> 两篇文章</p>
+
+<h2>动态多态（Dynamic Polymorphism）</h2>
+
+<p>动态指是真正执行的代码是在 <em>运行时</em> 才能确定的。
+实现主要依赖于 virtual function 的 overriding。</p>
+
+<p>example：</p>
+<div class="language-c++ highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="k">class</span> <span class="nc">Base</span>
+<span class="p">{</span>
+<span class="nl">public:</span>
+    <span class="kt">int</span> <span class="n">a</span><span class="p">;</span>
+    <span class="k">virtual</span> <span class="kt">void</span> <span class="n">doSomething</span><span class="p">()</span>
+    <span class="p">{</span>
+        <span class="n">std</span><span class="o">::</span><span class="n">cout</span> <span class="o">&lt;&lt;</span> <span class="s">"doSomething from Base</span><span class="se">\n</span><span class="s">"</span><span class="p">;</span>
+    <span class="p">}</span>
+ 
+    <span class="k">virtual</span> <span class="kt">void</span> <span class="n">doOtherThing</span><span class="p">()</span>
+    <span class="p">{</span>
+        <span class="n">std</span><span class="o">::</span><span class="n">cout</span> <span class="o">&lt;&lt;</span> <span class="s">"doOtherThing from Base</span><span class="se">\n</span><span class="s">"</span><span class="p">;</span>
+    <span class="p">}</span>
+<span class="p">};</span>
+ 
+<span class="k">class</span> <span class="nc">Derived</span> <span class="o">:</span> <span class="k">public</span> <span class="n">Base</span>
+<span class="p">{</span>
+<span class="nl">public:</span>
+    <span class="kt">int</span> <span class="n">b</span><span class="p">,</span> <span class="n">c</span><span class="p">;</span>
+    <span class="kt">void</span> <span class="n">doSomething</span><span class="p">()</span> <span class="k">override</span> <span class="c1">// override implies virtual</span>
+    <span class="p">{</span>
+        <span class="n">std</span><span class="o">::</span><span class="n">cout</span> <span class="o">&lt;&lt;</span> <span class="s">"doSomething from Derived</span><span class="se">\n</span><span class="s">"</span><span class="p">;</span>
+    <span class="p">}</span>
+<span class="p">};</span>
+ 
+<span class="n">std</span><span class="o">::</span><span class="n">shared_ptr</span><span class="o">&lt;</span><span class="n">Base</span><span class="o">&gt;</span> <span class="n">b</span><span class="p">{</span><span class="n">std</span><span class="o">::</span><span class="n">make_shared</span><span class="o">&lt;</span><span class="n">Derived</span><span class="o">&gt;</span><span class="p">()};</span>
+<span class="n">b</span><span class="o">-&gt;</span><span class="n">doSomething</span><span class="p">();</span> <span class="c1">// prints "doSomething from Derived"</span>
+</code></pre></div></div>
+
+<p>当一个 function 被 virtual 定义时，编译器会得知这个 function 可能会在子类中被重定义，因此只能在 runtime 时才能得到正确的执行代码。那么程序如何在运行时找到正确的 function？这里就需要依赖 vtable 与 vptr 结构。</p>
+
+<h3>vtable 与 vptr</h3>
+
+<p>每个包含 virtual function 的 class 都会包含一个 vptr 用于指向一个 vtable 结构。vtable 用于存储一个 class 的所有 virtual function 的地址信息。</p>
+
+<p><img src="/assets/vtable.jpg" alt="vtable" /></p>
+
+<p>通过 -O0 得到的编译代码中，vtable 信息如下：</p>
+
+<p><img src="/assets/compile.jpg" alt="compile" /></p>
+
+<p>具体的编译结果可见：<a href="https://godbolt.org/z/6enMqnoGW">Compiler Explorer</a></p>
+
+<h2>静态多态（Static Polymorphism）</h2>
+
+<p>静态多态的静态是指 object 的类型以及要调用的 function 都是在编译器就决定好的。通常实现静态多态的方式主要包括：</p>
+
+<ul>
+  <li>function overloading</li>
+  <li>operator overloading</li>
+  <li>templates</li>
+</ul>
+
+<div class="language-c++ highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="c1">// function overloading</span>
+<span class="kt">double</span> <span class="nf">do_oper</span><span class="p">(</span><span class="kt">int</span> <span class="n">a</span><span class="p">)</span> <span class="c1">// #1</span>
+<span class="p">{</span>
+    <span class="k">return</span> <span class="n">a</span> <span class="o">*</span> <span class="mi">2</span><span class="p">;</span>
+<span class="p">}</span>
+ 
+<span class="kt">double</span> <span class="n">do_oper</span><span class="p">(</span><span class="kt">double</span> <span class="n">a</span><span class="p">)</span> <span class="c1">// #2</span>
+<span class="p">{</span>
+    <span class="k">return</span> <span class="n">a</span> <span class="o">*</span> <span class="mi">2</span><span class="p">;</span>
+<span class="p">}</span>
+ 
+<span class="k">auto</span> <span class="n">oper1</span> <span class="o">=</span> <span class="n">do_oper</span><span class="p">(</span><span class="mi">5</span><span class="p">);</span> <span class="c1">// #1 is called</span>
+<span class="k">auto</span> <span class="n">oper2</span> <span class="o">=</span> <span class="n">do_oper</span><span class="p">(</span><span class="mf">5.0</span><span class="p">);</span> <span class="c1">// #2 is called</span>
+
+<span class="c1">// operator overloading(already provided by compiler)</span>
+<span class="k">auto</span> <span class="n">sum</span> <span class="o">=</span> <span class="mi">1</span> <span class="o">+</span> <span class="mi">2</span><span class="p">;</span> <span class="c1">// operator+ adds the integers</span>
+<span class="k">auto</span> <span class="n">concat</span> <span class="o">=</span> <span class="n">std</span><span class="o">::</span><span class="n">string</span><span class="p">{</span><span class="s">"1"</span><span class="p">}</span> <span class="o">+</span> <span class="n">std</span><span class="o">::</span><span class="n">string</span><span class="p">{</span><span class="s">"2"</span><span class="p">};</span> <span class="c1">// operator+ concatenates the strings</span>
+
+<span class="k">auto</span> <span class="n">sum_double</span> <span class="o">=</span> <span class="n">do_sum</span><span class="p">(</span><span class="mf">1.0</span><span class="p">,</span> <span class="mf">2.0</span><span class="p">);</span> <span class="c1">// double do_sum(double a, double b) is called</span>
+<span class="c1">// template</span>
+<span class="k">template</span> <span class="o">&lt;</span><span class="k">class</span> <span class="nc">T</span><span class="p">&gt;</span>
+<span class="n">T</span> <span class="n">do_sum</span><span class="p">(</span><span class="n">T</span> <span class="n">a</span><span class="p">,</span> <span class="n">T</span> <span class="n">b</span><span class="p">)</span>
+<span class="p">{</span>
+    <span class="k">return</span> <span class="n">a</span> <span class="o">+</span> <span class="n">b</span><span class="p">;</span>
+<span class="p">}</span>
+ 
+<span class="k">auto</span> <span class="n">sum_int</span> <span class="o">=</span> <span class="n">do_sum</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">);</span> <span class="c1">// int do_sum(int a, int b) is called</span>
+</code></pre></div></div>
+
+<p>此外，使用 template 实现静态多态还有一种专门的设计方式：CRTP（curiously recurring template pattern ）
+其定义方式如下：</p>
+
+<div class="language-c++ highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="k">template</span><span class="o">&lt;</span><span class="k">class</span> <span class="nc">Z</span><span class="p">&gt;</span>
+<span class="k">class</span> <span class="nc">Y</span> <span class="p">{};</span>
+ 
+<span class="k">class</span> <span class="nc">X</span> <span class="o">:</span> <span class="k">public</span> <span class="n">Y</span><span class="o">&lt;</span><span class="n">X</span><span class="o">&gt;</span> <span class="p">{};</span>
+</code></pre></div></div>
+
+<p>通常的设计是在 base class 中，实现一个函数，将 base 强转为 T 对应的 class，调用其对应的 function</p>
+
+<p>example：</p>
+<div class="language-c++ highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="cp">#include</span> <span class="cpf">&lt;iostream&gt;</span><span class="cp">
+</span> 
+<span class="k">template</span> <span class="o">&lt;</span><span class="k">class</span> <span class="nc">Derived</span><span class="p">&gt;</span>
+<span class="k">struct</span> <span class="nc">Base</span> <span class="p">{</span> <span class="kt">void</span> <span class="n">name</span><span class="p">()</span> <span class="p">{</span> <span class="p">(</span><span class="k">static_cast</span><span class="o">&lt;</span><span class="n">Derived</span><span class="o">*&gt;</span><span class="p">(</span><span class="k">this</span><span class="p">))</span><span class="o">-&gt;</span><span class="n">impl</span><span class="p">();</span> <span class="p">}</span> <span class="p">};</span>
+ 
+<span class="k">struct</span> <span class="nc">D1</span> <span class="o">:</span> <span class="k">public</span> <span class="n">Base</span><span class="o">&lt;</span><span class="n">D1</span><span class="o">&gt;</span> <span class="p">{</span> <span class="kt">void</span> <span class="n">impl</span><span class="p">()</span> <span class="p">{</span> <span class="n">std</span><span class="o">::</span><span class="n">cout</span> <span class="o">&lt;&lt;</span> <span class="s">"D1::impl()</span><span class="se">\n</span><span class="s">"</span><span class="p">;</span> <span class="p">}</span> <span class="p">};</span>
+<span class="k">struct</span> <span class="nc">D2</span> <span class="o">:</span> <span class="k">public</span> <span class="n">Base</span><span class="o">&lt;</span><span class="n">D2</span><span class="o">&gt;</span> <span class="p">{</span> <span class="kt">void</span> <span class="n">impl</span><span class="p">()</span> <span class="p">{</span> <span class="n">std</span><span class="o">::</span><span class="n">cout</span> <span class="o">&lt;&lt;</span> <span class="s">"D2::impl()</span><span class="se">\n</span><span class="s">"</span><span class="p">;</span> <span class="p">}</span> <span class="p">};</span>
+ 
+<span class="kt">int</span> <span class="n">main</span><span class="p">()</span>
+<span class="p">{</span>
+    <span class="n">Base</span><span class="o">&lt;</span><span class="n">D1</span><span class="o">&gt;</span> <span class="n">b1</span><span class="p">;</span> <span class="n">b1</span><span class="p">.</span><span class="n">name</span><span class="p">();</span>
+    <span class="n">Base</span><span class="o">&lt;</span><span class="n">D2</span><span class="o">&gt;</span> <span class="n">b2</span><span class="p">;</span> <span class="n">b2</span><span class="p">.</span><span class="n">name</span><span class="p">();</span>
+ 
+    <span class="n">D1</span> <span class="n">d1</span><span class="p">;</span> <span class="n">d1</span><span class="p">.</span><span class="n">name</span><span class="p">();</span>
+    <span class="n">D2</span> <span class="n">d2</span><span class="p">;</span> <span class="n">d2</span><span class="p">.</span><span class="n">name</span><span class="p">();</span>
+<span class="p">}</span>
+
+<span class="c1">// output:</span>
+<span class="n">D1</span><span class="o">::</span><span class="n">impl</span><span class="p">()</span>
+<span class="n">D2</span><span class="o">::</span><span class="n">impl</span><span class="p">()</span>
+<span class="n">D1</span><span class="o">::</span><span class="n">impl</span><span class="p">()</span>
+<span class="n">D2</span><span class="o">::</span><span class="n">impl</span><span class="p">()</span>
+</code></pre></div></div>
+
+<h2>动态多态的性能问题</h2>
+
+<p>运行时才能确定真正执行的函数，会带来以下问题：</p>
+
+<ul>
+  <li>额外的存储空间（vptr）</li>
+  <li>额外的重定向 (pointer dereference)</li>
+  <li>无法 inline 化</li>
+  <li>cache miss</li>
+</ul>
+
+<h3>额外的存储空间与重定向</h3>
+
+<p>相比 native 的函数调用，多了一步查表操作
+例子：<a href="https://quick-bench.com/q/E9ZRucuYA6zh7lHeN3wsyGNWUvo">https://quick-bench.com/q/E9ZRucuYA6zh7lHeN3wsyGNWUvo</a>
+因此，对于不会被用作 base 的 class，不要为其定义 virtual functions，尤其是 virtual deconstructor：<a href="https://flylib.com/books/en/2.887.1.19/1/">Effective C++：Item 7</a></p>
+
+<h3>无法 inline 化</h3>
+
+<p>当 virtual function 需要通过 vptr 来调用时，compiler 无法对其进行 inline 优化</p>
+
+<div class="language-c++ highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="k">class</span> <span class="nc">Base</span>
+<span class="p">{</span>
+<span class="nl">public:</span>
+    <span class="k">virtual</span> <span class="kt">bool</span> <span class="n">doSomething</span><span class="p">()</span> <span class="p">{</span> <span class="k">return</span> <span class="nb">true</span><span class="p">;</span> <span class="p">}</span>
+<span class="p">};</span>
+ 
+<span class="k">class</span> <span class="nc">Derived</span> <span class="o">:</span> <span class="k">public</span> <span class="n">Base</span>
+<span class="p">{</span>
+    <span class="kt">bool</span> <span class="n">doSomething</span><span class="p">()</span> <span class="k">override</span> <span class="p">{</span> <span class="k">return</span> <span class="nb">false</span><span class="p">;</span> <span class="p">}</span>
+<span class="p">};</span>
+ 
+<span class="n">Base</span> <span class="n">b</span><span class="p">;</span>
+<span class="n">b</span><span class="p">.</span><span class="n">doSomething</span><span class="p">();</span> <span class="c1">// this can be inlined</span>
+ 
+<span class="n">Base</span><span class="o">*</span> <span class="n">b1</span> <span class="o">=</span> <span class="k">new</span> <span class="n">Derived</span><span class="p">;</span>
+<span class="n">b1</span><span class="o">-&gt;</span><span class="n">doSomething</span><span class="p">();</span> <span class="c1">// this cannot</span>
+<span class="k">delete</span> <span class="n">b1</span><span class="p">;</span>
+</code></pre></div></div>
+
+<h3>cache miss</h3>
+
+<p>使用 virtual function 带来的 cache miss 会远大于使用 template 的情况</p>
+
+<p>example:</p>
+
+<div class="language-c++ highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="k">static</span> <span class="kt">void</span> <span class="nf">DynamicPolymorphism</span><span class="p">()</span> <span class="p">{</span>
+  <span class="n">std</span><span class="o">::</span><span class="n">vector</span><span class="o">&lt;</span><span class="n">BaseDP</span><span class="o">*&gt;</span> <span class="n">ptrs</span><span class="p">;</span>
+  <span class="k">for</span> <span class="p">(</span><span class="kt">int</span> <span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="mi">5000</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span>
+  <span class="p">{</span>
+    <span class="n">ptrs</span><span class="p">.</span><span class="n">push_back</span><span class="p">(</span><span class="k">new</span> <span class="n">DerivedDP</span><span class="p">);</span>
+  <span class="p">}</span>
+
+  <span class="c1">// profiling</span>
+  <span class="k">for</span> <span class="p">(</span><span class="k">const</span> <span class="k">auto</span><span class="o">&amp;</span> <span class="n">ptr</span> <span class="o">:</span> <span class="n">ptrs</span><span class="p">)</span>
+    <span class="n">ptr</span><span class="o">-&gt;</span><span class="n">process</span><span class="p">();</span>
+  <span class="c1">// Make sure the variable is not optimized away by compiler</span>
+  <span class="c1">// benchmark::DoNotOptimize(created_string);</span>
+
+  <span class="k">for</span> <span class="p">(</span><span class="k">auto</span><span class="o">&amp;</span> <span class="n">ptr</span> <span class="o">:</span> <span class="n">ptrs</span><span class="p">)</span>
+    <span class="k">delete</span> <span class="n">ptr</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">static</span> <span class="kt">void</span> <span class="n">StaticPolymorphism</span><span class="p">()</span> <span class="p">{</span>
+  <span class="n">std</span><span class="o">::</span><span class="n">vector</span><span class="o">&lt;</span><span class="n">BaseSP</span><span class="o">&lt;</span><span class="n">DerivedSP</span><span class="o">&gt;*&gt;</span> <span class="n">ptrs</span><span class="p">;</span>
+  <span class="k">for</span> <span class="p">(</span><span class="kt">int</span> <span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="mi">5000</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span>
+  <span class="p">{</span>
+    <span class="n">ptrs</span><span class="p">.</span><span class="n">push_back</span><span class="p">(</span><span class="k">new</span> <span class="n">BaseSP</span><span class="o">&lt;</span><span class="n">DerivedSP</span><span class="o">&gt;</span><span class="p">);</span>
+  <span class="p">}</span>
+
+  <span class="c1">// profilling</span>
+  <span class="k">for</span> <span class="p">(</span><span class="k">const</span> <span class="k">auto</span><span class="o">&amp;</span> <span class="n">ptr</span> <span class="o">:</span> <span class="n">ptrs</span><span class="p">)</span>
+    <span class="n">ptr</span><span class="o">-&gt;</span><span class="n">process</span><span class="p">();</span>
+
+  <span class="k">for</span> <span class="p">(</span><span class="k">auto</span><span class="o">&amp;</span> <span class="n">ptr</span> <span class="o">:</span> <span class="n">ptrs</span><span class="p">)</span>
+    <span class="k">delete</span> <span class="n">ptr</span><span class="p">;</span>
+<span class="p">}</span>
+</code></pre></div></div>
+
+<p>使用 cachegrind 和 qcachegrind（mac 上，linux 是 kcachegrind） 查看 cache 命中情况：
+<img src="/assets/qcache.jpg" alt="qcache" /></p>
+
+<h1>其他替代 virtual function 的方法</h1>
+
+<h2>基于 std::variant</h2>
+
+<p>std::variant 是 c++17 引入的类型安全的 union 结构。一个 std::variant 实例只能是其定义的一种类型，极少可能会达到 no value 的状态 ([std::variant<Types...>::valueless_by_exception](https://en.cppreference.com/w/cpp/utility/variant/valueless_by_exception)) 。</Types...></p>
+
+<p>用 std::variant 实现多态，需要基于一种 visitor 设计模式，即定义好所有的类型，对每个类型编写对应的 function 实现，在实际调用时基于 variant 的 value 类型选择要执行的 function。</p>
+
+<p>example：</p>
+
+<div class="language-c++ highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="k">struct</span> <span class="nc">Type</span>
+<span class="p">{</span>
+    <span class="n">Type</span><span class="p">(</span><span class="kt">int</span> <span class="n">type</span><span class="p">)</span> <span class="o">:</span> <span class="n">type_</span><span class="p">(</span><span class="n">type</span><span class="p">)</span> <span class="p">{</span> <span class="p">}</span>
+    <span class="kt">int</span> <span class="n">type_</span><span class="p">;</span>
+<span class="p">};</span>
+
+<span class="k">struct</span> <span class="nc">A</span>
+<span class="p">{</span>
+    <span class="kt">int</span> <span class="n">f_impl</span><span class="p">()</span> <span class="k">const</span> <span class="p">{</span> <span class="k">return</span> <span class="mi">1</span><span class="p">;</span> <span class="p">}</span>
+<span class="p">};</span>
+
+<span class="k">struct</span> <span class="nc">B</span>
+<span class="p">{</span>
+    <span class="kt">int</span> <span class="n">f_impl</span><span class="p">()</span> <span class="k">const</span> <span class="p">{</span> <span class="k">return</span> <span class="mi">2</span><span class="p">;</span> <span class="p">}</span>
+<span class="p">};</span>
+
+<span class="c1">/// 定义 variant</span>
+<span class="k">using</span> <span class="n">VAR</span><span class="o">=</span><span class="n">std</span><span class="o">::</span><span class="n">vector</span><span class="o">&lt;</span><span class="n">std</span><span class="o">::</span><span class="n">variant</span><span class="o">&lt;</span><span class="n">A</span><span class="p">,</span> <span class="n">B</span><span class="o">&gt;&gt;</span><span class="p">;</span>
+<span class="n">VAR</span> <span class="n">var</span><span class="p">;</span>
+<span class="k">for</span> <span class="p">(</span><span class="kt">int</span> <span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="mi">1000</span><span class="p">;</span> <span class="o">++</span><span class="n">i</span><span class="p">)</span>
+<span class="p">{</span>
+    <span class="n">std</span><span class="o">::</span><span class="n">variant</span><span class="o">&lt;</span><span class="n">A</span><span class="p">,</span> <span class="n">B</span><span class="o">&gt;</span> <span class="n">va</span><span class="p">;</span>
+    <span class="k">if</span> <span class="p">(</span><span class="n">i</span> <span class="o">%</span> <span class="mi">2</span><span class="p">)</span>
+        <span class="n">va</span> <span class="o">=</span> <span class="n">A</span><span class="p">();</span>
+    <span class="k">else</span>
+        <span class="n">va</span> <span class="o">=</span> <span class="n">B</span><span class="p">();</span>
+    <span class="n">var</span><span class="p">.</span><span class="n">push_back</span><span class="p">(</span><span class="n">va</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="c1">/// visit with std::visit</span>
+<span class="kt">int</span> <span class="n">v_total</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+<span class="k">struct</span> <span class="nc">CallFunc</span> <span class="p">{</span>
+    <span class="kt">void</span> <span class="k">operator</span><span class="p">()(</span><span class="k">const</span> <span class="n">A</span><span class="o">&amp;</span> <span class="n">a</span><span class="p">)</span> <span class="k">const</span> <span class="p">{</span> <span class="n">v_total</span> <span class="o">+=</span> <span class="n">a</span><span class="p">.</span><span class="n">f_impl</span><span class="p">();</span> <span class="p">}</span>
+    <span class="kt">void</span> <span class="k">operator</span><span class="p">()(</span><span class="k">const</span> <span class="n">B</span><span class="o">&amp;</span> <span class="n">b</span><span class="p">)</span> <span class="k">const</span> <span class="p">{</span> <span class="n">v_total</span> <span class="o">+=</span> <span class="n">b</span><span class="p">.</span><span class="n">f_impl</span><span class="p">();</span> <span class="p">}</span>
+<span class="p">};</span>
+
+<span class="k">for</span> <span class="p">(</span><span class="kt">int</span> <span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="mi">100000</span><span class="p">;</span> <span class="o">++</span><span class="n">i</span><span class="p">)</span>
+    <span class="k">for</span> <span class="p">(</span><span class="k">auto</span> <span class="o">&amp;</span> <span class="n">v</span> <span class="o">:</span> <span class="n">var</span><span class="p">)</span>
+        <span class="n">std</span><span class="o">::</span><span class="n">visit</span><span class="p">(</span><span class="n">CallFunc</span><span class="p">{},</span> <span class="n">v</span><span class="p">);</span>
+
+<span class="c1">/// visit with holds_alternative</span>
+<span class="kt">int</span> <span class="n">callFImpl</span><span class="p">(</span><span class="k">const</span> <span class="n">std</span><span class="o">::</span><span class="n">variant</span><span class="o">&lt;</span><span class="n">A</span><span class="p">,</span> <span class="n">B</span><span class="o">&gt;&amp;</span> <span class="n">type</span><span class="p">)</span> <span class="p">{</span>
+    <span class="k">if</span> <span class="p">(</span><span class="n">std</span><span class="o">::</span><span class="n">holds_alternative</span><span class="o">&lt;</span><span class="n">A</span><span class="o">&gt;</span><span class="p">(</span><span class="n">type</span><span class="p">))</span> <span class="p">{</span>
+      <span class="k">return</span> <span class="n">std</span><span class="o">::</span><span class="n">get</span><span class="o">&lt;</span><span class="n">A</span><span class="o">&gt;</span><span class="p">(</span><span class="n">type</span><span class="p">).</span><span class="n">f_impl</span><span class="p">();</span>
+    <span class="p">}</span> 
+
+    <span class="k">return</span> <span class="n">std</span><span class="o">::</span><span class="n">get</span><span class="o">&lt;</span><span class="n">B</span><span class="o">&gt;</span><span class="p">(</span><span class="n">type</span><span class="p">).</span><span class="n">f_impl</span><span class="p">();</span>
+<span class="p">}</span>
+<span class="n">total</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+<span class="k">for</span> <span class="p">(</span><span class="kt">int</span> <span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="mi">100000</span><span class="p">;</span> <span class="o">++</span><span class="n">i</span><span class="p">)</span>
+    <span class="k">for</span> <span class="p">(</span><span class="k">auto</span> <span class="o">&amp;</span> <span class="n">v</span> <span class="o">:</span> <span class="n">var</span><span class="p">)</span>
+        <span class="n">total</span> <span class="o">+=</span> <span class="n">callFImpl</span><span class="p">(</span><span class="n">v</span><span class="p">);</span>
+</code></pre></div></div>
+
+<p>std::variant 与 virtual function 的比较：
+<img src="/assets/variant.jpg" alt="variant" /></p>
+
+<p>性能比较：
+<a href="https://quick-bench.com/q/Mcclomh03nu8nDCgT3T302xKnXY">Quick C++ Benchmarks</a></p>
+
+<h2>基于 concept</h2>
+
+<p>主要基于 <a href="https://www.fluentcpp.com/2020/09/11/replacing-crtp-static-polymorphism-with-concepts/">Replacing CRTP Static Polymorphism With Concepts - Fluent C++</a> 整理</p>
+
+<p>CRTP 的问题：</p>
+
+<ul>
+  <li>多了一层间接的调用语意，可读性比较差，比如下面的代码，需要实现不同的 log 级别输出， 以 CRTP 的写法如下：</li>
+</ul>
+
+<div class="language-c++ highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="k">template</span> <span class="o">&lt;</span><span class="k">typename</span> <span class="nc">TLoggerImpl</span><span class="p">&gt;</span>
+<span class="k">class</span> <span class="nc">Logger</span> <span class="p">{</span>
+<span class="nl">public:</span>
+  <span class="kt">void</span> <span class="n">LogDebug</span><span class="p">(</span><span class="n">std</span><span class="o">::</span><span class="n">string_view</span> <span class="n">message</span><span class="p">)</span> <span class="p">{</span>
+    <span class="n">Impl</span><span class="p">().</span><span class="n">DoLogDebug</span><span class="p">(</span><span class="n">message</span><span class="p">);</span>
+  <span class="p">}</span>
+  <span class="kt">void</span> <span class="n">LogInfo</span><span class="p">(</span><span class="n">std</span><span class="o">::</span><span class="n">string_view</span> <span class="n">message</span><span class="p">)</span> <span class="p">{</span>
+    <span class="n">Impl</span><span class="p">().</span><span class="n">DoLogInfo</span><span class="p">(</span><span class="n">message</span><span class="p">);</span>
+  <span class="p">}</span>
+  <span class="kt">void</span> <span class="n">LogError</span><span class="p">(</span><span class="n">std</span><span class="o">::</span><span class="n">string_view</span> <span class="n">message</span><span class="p">)</span> <span class="p">{</span>
+    <span class="n">Impl</span><span class="p">().</span><span class="n">DoLogError</span><span class="p">(</span><span class="n">message</span><span class="p">);</span>
+  <span class="p">}</span>
+<span class="nl">private:</span>
+ <span class="o">*</span><span class="n">TLoggerImpl</span><span class="o">&amp;</span> <span class="n">Impl</span><span class="p">()</span> <span class="p">{</span> <span class="k">return</span> <span class="k">static_cast</span><span class="o">&lt;</span><span class="n">TLoggerImpl</span><span class="o">&amp;&gt;</span><span class="p">(</span><span class="o">*</span><span class="k">this</span><span class="p">);</span> <span class="p">}</span>
+<span class="o">*</span>  <span class="k">friend</span> <span class="n">TLoggerImpl</span><span class="p">;</span>
+<span class="p">};</span>
+
+<span class="k">template</span> <span class="o">&lt;</span><span class="k">typename</span> <span class="nc">TLoggerImpl</span><span class="p">&gt;</span>
+<span class="kt">void</span> <span class="n">LogToAll</span><span class="p">(</span><span class="n">Logger</span><span class="o">&lt;</span><span class="n">TLoggerImpl</span><span class="o">&gt;&amp;</span> <span class="n">logger</span><span class="p">,</span> <span class="n">std</span><span class="o">::</span><span class="n">string_view</span> <span class="n">message</span><span class="p">)</span> <span class="p">{</span>
+  <span class="n">logger</span><span class="p">.</span><span class="n">LogDebug</span><span class="p">(</span><span class="n">message</span><span class="p">);</span>
+  <span class="n">logger</span><span class="p">.</span><span class="n">LogInfo</span><span class="p">(</span><span class="n">message</span><span class="p">);</span>
+  <span class="n">logger</span><span class="p">.</span><span class="n">LogError</span><span class="p">(</span><span class="n">message</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">struct</span> <span class="nc">CustomLogger</span> <span class="o">:</span> <span class="k">public</span> <span class="n">Logger</span><span class="o">&lt;</span><span class="n">CustomLogger</span><span class="o">&gt;</span> <span class="p">{</span>
+  <span class="kt">void</span> <span class="n">DoLogDebug</span><span class="p">(</span><span class="n">std</span><span class="o">::</span><span class="n">string_view</span> <span class="n">message</span><span class="p">)</span> <span class="k">const</span> <span class="p">{</span>
+    <span class="n">std</span><span class="o">::</span><span class="n">cout</span> <span class="o">&lt;&lt;</span> <span class="s">"[Debug] "</span> <span class="o">&lt;&lt;</span> <span class="n">message</span> <span class="o">&lt;&lt;</span> <span class="sc">'\n'</span><span class="p">;</span>
+  <span class="p">}</span>
+  <span class="kt">void</span> <span class="n">DoLogInfo</span><span class="p">(</span><span class="n">std</span><span class="o">::</span><span class="n">string_view</span> <span class="n">message</span><span class="p">)</span> <span class="k">const</span> <span class="p">{</span>
+    <span class="n">std</span><span class="o">::</span><span class="n">cout</span> <span class="o">&lt;&lt;</span> <span class="s">"[Info] "</span> <span class="o">&lt;&lt;</span> <span class="n">message</span> <span class="o">&lt;&lt;</span> <span class="sc">'\n'</span><span class="p">;</span>
+  <span class="p">}</span>
+  <span class="kt">void</span> <span class="n">DoLogError</span><span class="p">(</span><span class="n">std</span><span class="o">::</span><span class="n">string_view</span> <span class="n">message</span><span class="p">)</span> <span class="k">const</span> <span class="p">{</span>
+    <span class="n">std</span><span class="o">::</span><span class="n">cout</span> <span class="o">&lt;&lt;</span> <span class="s">"[Error] "</span> <span class="o">&lt;&lt;</span> <span class="n">message</span> <span class="o">&lt;&lt;</span> <span class="sc">'\n'</span><span class="p">;</span>
+  <span class="p">}</span>
+<span class="p">};</span>
+
+<span class="k">struct</span> <span class="nc">TestLogger</span> <span class="o">:</span> <span class="k">public</span> <span class="n">Logger</span><span class="o">&lt;</span><span class="n">TestLogger</span><span class="o">&gt;</span> <span class="p">{</span>
+  <span class="kt">void</span> <span class="n">DoLogDebug</span><span class="p">(</span><span class="n">std</span><span class="o">::</span><span class="n">string_view</span><span class="p">)</span> <span class="k">const</span> <span class="p">{}</span>
+  <span class="kt">void</span> <span class="n">DoLogInfo</span><span class="p">(</span><span class="n">std</span><span class="o">::</span><span class="n">string_view</span><span class="p">)</span> <span class="k">const</span> <span class="p">{}</span>
+  <span class="kt">void</span> <span class="n">DoLogError</span><span class="p">(</span><span class="n">std</span><span class="o">::</span><span class="n">string_view</span><span class="p">)</span> <span class="k">const</span> <span class="p">{}</span>
+<span class="p">};</span>
+
+
+<span class="n">CustomLogger</span> <span class="n">custom_logger</span><span class="p">;</span>
+<span class="n">LogToAll</span><span class="p">(</span><span class="n">custom_logger</span><span class="p">,</span> <span class="err">“</span><span class="n">Hello</span> <span class="n">World</span><span class="err">”</span><span class="p">);</span>
+<span class="n">TestLogger</span> <span class="n">test_logger</span><span class="p">;</span>
+<span class="n">LogToAll</span><span class="p">(</span><span class="n">test_logger</span><span class="p">,</span> <span class="err">“</span><span class="n">Hello</span> <span class="n">World</span><span class="err">”</span><span class="p">);</span>
+</code></pre></div></div>
+
+<p>concept 在 c++ 20 引入，用于为 template 的 type 规定限制条件，以下是上面 Log 功能的 concept 实现。</p>
+
+<div class="language-c++ highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="c1">/// 定义一个 concept</span>
+<span class="k">template</span> <span class="o">&lt;</span><span class="k">typename</span> <span class="nc">TLoggerImpl</span><span class="p">&gt;</span>
+<span class="k">concept</span> <span class="n">LoggerLike</span> <span class="o">=</span> <span class="k">requires</span><span class="p">(</span><span class="n">TLoggerImpl</span> <span class="n">log</span><span class="p">)</span> <span class="p">{</span>
+  <span class="n">log</span><span class="p">.</span><span class="n">LogDebug</span><span class="p">(</span><span class="n">std</span><span class="o">::</span><span class="n">string_view</span><span class="p">{});</span>
+  <span class="n">log</span><span class="p">.</span><span class="n">LogInfo</span><span class="p">(</span><span class="n">std</span><span class="o">::</span><span class="n">string_view</span><span class="p">{});</span>
+  <span class="n">log</span><span class="p">.</span><span class="n">LogError</span><span class="p">(</span><span class="n">std</span><span class="o">::</span><span class="n">string_view</span><span class="p">{});</span>
+<span class="p">};</span>
+
+<span class="c1">/// 定义调用类1</span>
+<span class="k">struct</span> <span class="nc">CustomLogger</span> <span class="p">{</span>
+  <span class="kt">void</span> <span class="n">LogDebug</span><span class="p">(</span><span class="n">std</span><span class="o">::</span><span class="n">string_view</span> <span class="n">message</span><span class="p">)</span> <span class="k">const</span> <span class="p">{</span>
+    <span class="n">std</span><span class="o">::</span><span class="n">cout</span> <span class="o">&lt;&lt;</span> <span class="s">"[Debug] "</span> <span class="o">&lt;&lt;</span> <span class="n">message</span> <span class="o">&lt;&lt;</span> <span class="sc">'\n'</span><span class="p">;</span>
+  <span class="p">}</span>
+  <span class="kt">void</span> <span class="n">LogInfo</span><span class="p">(</span><span class="n">std</span><span class="o">::</span><span class="n">string_view</span> <span class="n">message</span><span class="p">)</span> <span class="k">const</span> <span class="p">{</span>
+    <span class="n">std</span><span class="o">::</span><span class="n">cout</span> <span class="o">&lt;&lt;</span> <span class="s">"[Info] "</span> <span class="o">&lt;&lt;</span> <span class="n">message</span> <span class="o">&lt;&lt;</span> <span class="sc">'\n'</span><span class="p">;</span>
+  <span class="p">}</span>
+  <span class="kt">void</span> <span class="n">LogError</span><span class="p">(</span><span class="n">std</span><span class="o">::</span><span class="n">string_view</span> <span class="n">message</span><span class="p">)</span> <span class="k">const</span> <span class="p">{</span>
+    <span class="n">std</span><span class="o">::</span><span class="n">cout</span> <span class="o">&lt;&lt;</span> <span class="s">"[Error] "</span> <span class="o">&lt;&lt;</span> <span class="n">message</span> <span class="o">&lt;&lt;</span> <span class="sc">'\n'</span><span class="p">;</span>
+  <span class="p">}</span>
+<span class="p">};</span>
+
+<span class="c1">/// 定义调用类2</span>
+<span class="k">struct</span> <span class="nc">TestLogger</span> <span class="p">{</span>
+  <span class="kt">void</span> <span class="n">LogDebug</span><span class="p">(</span><span class="n">std</span><span class="o">::</span><span class="n">string_view</span><span class="p">)</span> <span class="k">const</span> <span class="p">{}</span>
+  <span class="kt">void</span> <span class="n">LogInfo</span><span class="p">(</span><span class="n">std</span><span class="o">::</span><span class="n">string_view</span><span class="p">)</span> <span class="k">const</span> <span class="p">{}</span>
+  <span class="kt">void</span> <span class="n">LogError</span><span class="p">(</span><span class="n">std</span><span class="o">::</span><span class="n">string_view</span><span class="p">)</span> <span class="k">const</span> <span class="p">{}</span>
+<span class="p">};</span>
+
+<span class="c1">/// 定义调用方法</span>
+<span class="k">template</span> <span class="o">&lt;</span><span class="n">LoggerLike</span> <span class="n">TLogger</span><span class="p">&gt;</span>
+<span class="kt">void</span> <span class="n">LogToAll</span><span class="p">(</span><span class="n">TLogger</span><span class="o">&amp;</span> <span class="n">logger</span><span class="p">,</span> <span class="n">std</span><span class="o">::</span><span class="n">string_view</span> <span class="n">message</span><span class="p">)</span> <span class="p">{</span>
+  <span class="n">logger</span><span class="p">.</span><span class="n">LogDebug</span><span class="p">(</span><span class="n">message</span><span class="p">);</span>
+  <span class="n">logger</span><span class="p">.</span><span class="n">LogInfo</span><span class="p">(</span><span class="n">message</span><span class="p">);</span>
+  <span class="n">logger</span><span class="p">.</span><span class="n">LogError</span><span class="p">(</span><span class="n">message</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">struct</span> <span class="nc">CustomLoggerImpl</span> <span class="p">{</span> <span class="err">…</span> <span class="p">};</span>
+
+<span class="k">struct</span> <span class="nc">TestLoggerImpl</span> <span class="p">{</span> <span class="err">…</span> <span class="p">};</span>
+
+<span class="k">using</span> <span class="n">CustomLogger</span> <span class="o">=</span> <span class="n">Logger</span><span class="o">&lt;</span><span class="n">CustomLoggerImpl</span><span class="o">&gt;</span><span class="p">;</span>
+<span class="k">using</span> <span class="n">TestLogger</span> <span class="o">=</span> <span class="n">Logger</span><span class="o">&lt;</span><span class="n">TestLoggerImpl</span><span class="o">&gt;</span><span class="p">;</span>
+
+<span class="c1">/// 实际调用</span>
+<span class="n">CustomLogger</span> <span class="n">custom_logger</span><span class="p">;</span>
+<span class="n">LogToAll</span><span class="p">(</span><span class="n">custom_logger</span><span class="p">,</span> <span class="s">"Hello World"</span><span class="p">);</span>
+<span class="n">TestLogger</span> <span class="n">test_logger</span><span class="p">;</span>
+<span class="n">LogToAll</span><span class="p">(</span><span class="n">test_logger</span><span class="p">,</span> <span class="s">"Hello World"</span><span class="p">);</span>
+</code></pre></div></div>
+
+<h2>Reference</h2>
+
+<ul>
+  <li><a href="https://thecppdev.com/2022/05/22/polymorphism-in-c/?noamp=available">Polymorphism in C++ - cppdev</a></li>
+  <li><a href="https://thecppdev.com/2022/05/26/dynamic-polymorphism-performance/?amp=1">Performance of dynamic polymorphism - cppdev</a></li>
+  <li><a href="https://en.cppreference.com/w/cpp/language/crtp">Curiously Recurring Template Pattern - cppreference.com</a></li>
+  <li><a href="https://flylib.com/books/en/2.887.1.19/1/">Item 7: Declare destructors virtual in polymorphic base classes</a></li>
+  <li><a href="https://valgrind.org/docs/manual/cg-manual.html">https://valgrind.org/docs/manual/cg-manual.html</a></li>
+  <li><a href="https://en.cppreference.com/w/cpp/utility/variant">https://en.cppreference.com/w/cpp/utility/variant</a></li>
+  <li><a href="http://cpptruths.blogspot.com/2018/02/inheritance-vs-stdvariant-based.html">Inheritance vs std::variant</a></li>
+  <li><a href="https://stackoverflow.com/questions/57726401/stdvariant-vs-inheritance-vs-other-ways-performance">https://stackoverflow.com/questions/57726401/stdvariant-vs-inheritance-vs-other-ways-performance</a></li>
+  <li><a href="https://en.cppreference.com/w/cpp/language/constraints">https://en.cppreference.com/w/cpp/language/constraints</a></li>
+  <li><a href="https://quick-bench.com/q/qKvbnsqH1MILeQNWg3XpFfS9f3s">https://quick-bench.com/q/qKvbnsqH1MILeQNWg3XpFfS9f3s</a></li>
+  <li><a href="https://gist.github.com/GuillaumeDua/b0f5e3a40ce49468607dd62f7b7809b1#concepts-as-static--runtime-polymorphism-providers">Concept-based polymorphism in modern C++ · GitHub</a></li>
+  <li><a href="https://www.cppfiddler.com/2019/06/09/concept-based-interfaces/">Interfaces with C++20 Concepts  cppfiddler</a></li>
+  <li><a href="https://www.fluentcpp.com/2020/09/11/replacing-crtp-static-polymorphism-with-concepts/">Replacing CRTP Static Polymorphism With Concepts - Fluent C++</a></li>
+</ul>
+
+
+  </div>
+
+  
+
+</article>
+
+      </div>
+    </main>
+
+    <footer class="site-footer">
+
+  <div class="wrapper">
+
+    <p>
+      
+
+&copy; xht - Powered by <a href="https://jekyllrb.com">Jekyll</a> &amp; <a href="https://github.com/yous/whiteglass">whiteglass</a> - Subscribe via <a href="https://yous.github.io/feed.xml">RSS</a>
+
+    </p>
+
+  </div>
+
+</footer>
+
+
+  </body>
+
+</html>
